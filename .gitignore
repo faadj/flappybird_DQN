@@ -2,6 +2,5 @@
 __pycache__/
 *.pyc
 .idea/
-trained_models/
 tensorboard/
 training_gifs/

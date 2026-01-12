@@ -25,8 +25,8 @@ def get_args():
     parser.add_argument("--optimizer", type=str, choices=["sgd", "adam"], default="adam")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--initial_epsilon", type=float, default=0.1)
-    parser.add_argument("--final_epsilon", type=float, default=2e-4)
+    parser.add_argument("--initial_epsilon", type=float, default=0.01)
+    parser.add_argument("--final_epsilon", type=float, default=1e-4)
     parser.add_argument("--num_iters", type=int, default=2000000)
     parser.add_argument("--replay_memory_size", type=int, default=50000)
     parser.add_argument("--log_path", type=str, default="tensorboard")
@@ -122,7 +122,7 @@ def train(opt):
             progress = (iter - 200000) / 800000
             game_state.pipe_gap_size = int(200 - (100 * progress))
         else:
-            game_state.pipe_gap_size = 100
+            game_state.pipe_gap_size = 150
         # ---------------------------------------
 
         prediction = model(state)[0]
