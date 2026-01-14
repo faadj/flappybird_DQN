@@ -4,6 +4,7 @@ import shutil
 import time
 from datetime import datetime
 from random import random, randint, sample
+import math
 
 import numpy as np
 import torch
@@ -27,7 +28,11 @@ def get_args():
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--initial_epsilon", type=float, default=0.01)
     parser.add_argument("--final_epsilon", type=float, default=1e-4)
-    parser.add_argument("--num_iters", type=int, default=2000000)
+
+    # --- CHANGE 1: INCREASE TOTAL ITERATIONS TO 4 MILLION ---
+    parser.add_argument("--num_iters", type=int, default=4000000)
+    # --------------------------------------------------------
+
     parser.add_argument("--replay_memory_size", type=int, default=50000)
     parser.add_argument("--log_path", type=str, default="tensorboard")
     parser.add_argument("--saved_path", type=str, default="trained_models")
@@ -41,14 +46,14 @@ def get_args():
     return args
 
 
-def update_plots(scores, losses, filepath):
+def update_plots(scores, losses, success_rates, filepath):
     if not scores: return
     directory = os.path.dirname(filepath)
     if not os.path.exists(directory): os.makedirs(directory)
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
     episodes = range(1, len(scores) + 1)
 
-    # Score Plot
+    # 1. Score
     ax1.scatter(episodes, scores, s=10, c='black', alpha=0.6, label='Score')
     if len(scores) > 10:
         window = max(5, len(scores) // 20)
@@ -57,10 +62,16 @@ def update_plots(scores, losses, filepath):
     ax1.set_ylabel('Score')
     ax1.grid(True)
 
-    # Loss Plot (LOG SCALE)
+    # 2. Loss
     ax2.semilogy(episodes, losses, color='orange', linewidth=1, label='Avg Loss')
-    ax2.set_ylabel('Avg Loss (Log Scale)')
+    ax2.set_ylabel('Avg Loss')
     ax2.grid(True, which="both", ls="-")
+
+    # 3. Success Rate
+    ax3.plot(episodes, success_rates, color='green', linewidth=2, label='Success Rate (>5 pipes)')
+    ax3.set_ylabel('Success Rate %')
+    ax3.set_xlabel('Episode')
+    ax3.grid(True)
 
     plt.tight_layout()
     plt.savefig(filepath)
@@ -77,6 +88,10 @@ def train(opt):
     if os.path.isdir(opt.log_path):
         shutil.rmtree(opt.log_path)
     os.makedirs(opt.log_path)
+
+    if not os.path.exists(opt.saved_path):
+        os.makedirs(opt.saved_path)
+
     writer = SummaryWriter(opt.log_path)
     optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr)
     criterion = nn.MSELoss()
@@ -94,6 +109,9 @@ def train(opt):
 
     game_scores = []
     game_losses = []
+    success_rates = []
+    recent_successes = []
+
     current_game_score = 0
     current_game_loss_sum = 0
     current_game_steps = 0
@@ -108,22 +126,30 @@ def train(opt):
     last_log_time = time.time()
     last_plot_time = time.time()
 
-    print(f"Training started (Lidar/Curriculum Mode). Vis: {'ON' if opt.vis else 'OFF'}")
+    print(f"Training started (Raycast Lidar Mode). Vis: {'ON' if opt.vis else 'OFF'}")
 
     while iter < opt.num_iters:
-        # --- CURRICULUM LEARNING (Corrected) ---
-        # 0-200k: Gap 200 (Easy)
-        # 200k-1M: Shrink 200 -> 100
-        # 1M+: Gap 100 (Hard)
+        # --- SEND PROGRESS TO GAME (For Display) ---
+        game_state.training_progress = iter / opt.num_iters
+        # -------------------------------------------
+
+        # --- CHANGE 2: SLOWER CURRICULUM ---
+        # 0 - 200k: Easy Mode (Gap 200)
+        # 200k - 3M: Very Slow Transition (Gap 200 -> 100)
+        # 3M+: Hard Mode (Gap 100)
+
         if iter < 200000:
             game_state.pipe_gap_size = 200
-        elif iter < 1000000:
-            # FIX: Divide by 800,000 (duration) and multiply by 100 (total shrink amount)
-            progress = (iter - 200000) / 800000
+            game_state.vertical_variance = 0.0
+        elif iter < 3000000:  # Extended from 1M to 3M
+            # Duration is now 2,800,000 steps (3M - 200k)
+            progress = (iter - 200000) / 2800000
             game_state.pipe_gap_size = int(200 - (100 * progress))
+            game_state.vertical_variance = progress
         else:
-            game_state.pipe_gap_size = 150
-        # ---------------------------------------
+            game_state.pipe_gap_size = 100
+            game_state.vertical_variance = 1.0
+        # -------------------------------------------
 
         prediction = model(state)[0]
         epsilon = opt.final_epsilon + (
@@ -144,7 +170,6 @@ def train(opt):
         if iter > 0 and iter % opt.gif_interval == 0:
             recording_gif = True
             gif_frames = []
-            print(f"Starting GIF capture at iteration {iter}...")
         if recording_gif:
             frame_rgb = np.transpose(image, (1, 0, 2))
             gif_frames.append(frame_rgb)
@@ -159,20 +184,26 @@ def train(opt):
 
         if opt.vis:
             view = cv2.cvtColor(np.transpose(image, (1, 0, 2)), cv2.COLOR_RGB2BGR)
-            bx, by = int(game_state.bird_x), int(game_state.bird_y)
-            next_pipe = None
-            for pipe in game_state.pipes:
-                if pipe["x_lower"] + game_state.pipe_width > bx:
-                    next_pipe = pipe
-                    break
-            if next_pipe is None: next_pipe = game_state.pipes[0]
+            bx = int(game_state.bird_x + game_state.bird_width / 2)
+            by = int(game_state.bird_y + game_state.bird_height / 2)
 
-            pipe_x = int(next_pipe["x_lower"])
-            pipe_target_y = int(next_pipe["y_lower"])
+            # Draw Lidar Fan
+            lidar_scope = 120
+            start_angle = -lidar_scope / 2
+            step = lidar_scope / 15
 
-            cv2.line(view, (bx, by), (pipe_x, by), (0, 0, 255), 2)
-            cv2.line(view, (pipe_x, by), (pipe_x, pipe_target_y), (0, 255, 0), 2)
-            cv2.circle(view, (pipe_x, pipe_target_y), 5, (255, 0, 0), -1)
+            for i in range(16):
+                dist_norm = next_state_np[i]
+                dist_px = dist_norm * 300
+
+                deg = start_angle + (step * i)
+                rad = math.radians(deg)
+
+                ex = int(bx + math.cos(rad) * dist_px)
+                ey = int(by + math.sin(rad) * dist_px)
+
+                color = (0, 255, 0) if dist_norm > 0.5 else (0, 0, 255)
+                cv2.line(view, (bx, by), (ex, ey), color, 1)
 
             cv2.imshow("Lidar Vision", view)
             cv2.waitKey(1)
@@ -213,13 +244,21 @@ def train(opt):
         state = next_state
         iter += 1
 
-        if reward == 1: current_game_score += 1
+        if reward >= 1: current_game_score += 1
         current_game_loss_sum += loss.item()
         current_game_steps += 1
+
         if terminal:
             game_scores.append(current_game_score)
             avg_loss = current_game_loss_sum / current_game_steps if current_game_steps > 0 else 0
             game_losses.append(avg_loss)
+
+            is_success = 1 if current_game_score >= 5 else 0
+            recent_successes.append(is_success)
+            if len(recent_successes) > 100: recent_successes.pop(0)
+            current_success_rate = sum(recent_successes) / len(recent_successes) * 100
+            success_rates.append(current_success_rate)
+
             current_game_score = 0
             current_game_loss_sum = 0
             current_game_steps = 0
@@ -227,15 +266,14 @@ def train(opt):
         current_time = time.time()
         if current_time - last_log_time >= 30:
             print(
-                f"Iter: {iter}/{opt.num_iters} | Gap: {game_state.pipe_gap_size} | Loss: {loss.item():.6f} | Eps: {epsilon:.4f} | Rwd: {reward} | Q: {torch.max(prediction).item():.4f}")
+                f"Iter: {iter}/{opt.num_iters} | Gap: {game_state.pipe_gap_size} | SR: {success_rates[-1] if success_rates else 0:.1f}% | Loss: {loss.item():.6f}")
             last_log_time = current_time
 
         if current_time - last_plot_time >= 60:
-            update_plots(game_scores, game_losses, plot_filename)
+            update_plots(game_scores, game_losses, success_rates, plot_filename)
             last_plot_time = current_time
 
         writer.add_scalar('Train/Loss', loss, iter)
-        writer.add_scalar('Train/Epsilon', epsilon, iter)
         writer.add_scalar('Train/Reward', reward, iter)
 
         if (iter + 1) % 1000000 == 0:
